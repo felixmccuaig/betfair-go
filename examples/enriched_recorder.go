@@ -6,6 +6,7 @@ import (
 	"os/signal"
 	"syscall"
 
+	betfair "github.com/felixmccuaig/betfair-go"
 	"github.com/joho/godotenv"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -21,7 +22,7 @@ func main() {
 	}
 
 	// Create and load configuration
-	cfg := NewConfig()
+	cfg := betfair.NewConfig()
 	if err := cfg.LoadFromEnv(); err != nil {
 		log.Fatal().Err(err).Msg("failed to load configuration")
 	}
@@ -32,7 +33,7 @@ func main() {
 	defer stop()
 
 	// Create market recorder with enrichment capabilities
-	recorder, err := NewMarketRecorder(cfg, logger)
+	recorder, err := betfair.NewMarketRecorder(cfg, logger)
 	if err != nil {
 		logger.Fatal().Err(err).Msg("failed to create market recorder")
 	}
