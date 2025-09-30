@@ -20,8 +20,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/config"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/parquet-go/parquet-go"
 )
 
 type MCMMessage struct {
@@ -88,31 +89,47 @@ type MarketState struct {
 }
 
 type SummaryRow struct {
-	MarketID              string
-	SelectionID           int64
-	EventID               string
-	EventName             string
-	Venue                 string
-	GreyhoundName         string
-	MarketTime            time.Time
-	BSP                   float64
-	LTP                   float64
-	Price30sBeforeStart   float64
-	TotalTradedVolume     float64
-	MaxTradedPrice        float64
-	MinTradedPrice        float64
-	Year                  int
-	Month                 int
-	Day                   int
-	Win                   bool
-	HasBSP                bool
-	HasLTP                bool
-	HasPrice30sBefore     bool
-	HasMaxTradedPrice     bool
-	HasMinTradedPrice     bool
+	MarketID              string    `parquet:"market_id"`
+	SelectionID           int64     `parquet:"selection_id"`
+	EventID               string    `parquet:"event_id"`
+	EventName             string    `parquet:"event_name"`
+	Venue                 string    `parquet:"venue"`
+	GreyhoundName         string    `parquet:"greyhound_name"`
+	MarketTime            time.Time `parquet:"market_time,timestamp(microsecond)"`
+	BSP                   float64   `parquet:"bsp,optional"`
+	LTP                   float64   `parquet:"ltp,optional"`
+	Price30sBeforeStart   float64   `parquet:"price_30s_before_start,optional"`
+	TotalTradedVolume     float64   `parquet:"total_traded_volume"`
+	MaxTradedPrice        float64   `parquet:"max_traded_price,optional"`
+	MinTradedPrice        float64   `parquet:"min_traded_price,optional"`
+	Year                  int       `parquet:"year"`
+	Month                 int       `parquet:"month"`
+	Day                   int       `parquet:"day"`
+	Win                   bool      `parquet:"win"`
+	HasBSP                bool      `parquet:"-"` // Don't include in parquet
+	HasLTP                bool      `parquet:"-"` // Don't include in parquet
+	HasPrice30sBefore     bool      `parquet:"-"` // Don't include in parquet
+	HasMaxTradedPrice     bool      `parquet:"-"` // Don't include in parquet
+	HasMinTradedPrice     bool      `parquet:"-"` // Don't include in parquet
+}
+
+type OutputFormat string
+
+const (
+	OutputFormatCSV     OutputFormat = "csv"
+	OutputFormatParquet OutputFormat = "parquet"
+)
+
+type ProcessorConfig struct {
+	OutputPath   string       // Base output path (can be S3 or local)
+	OutputFormat OutputFormat // csv or parquet
+	FileLimit    int          // Maximum files to process
+	Workers      int          // Number of parallel workers
+	DateFormat   string       // Date format for filename (e.g., "2006-01-02", "02-01-2006")
 }
 
 type MarketDataProcessor struct {
+	Config          ProcessorConfig
 	OutputDir       string
 	OutputFile      string
 	FileLimit       int
@@ -128,30 +145,48 @@ type MarketDataProcessor struct {
 }
 
 func NewMarketDataProcessor(outputPath string, fileLimit int, workers int) *MarketDataProcessor {
-	if workers <= 0 {
-		workers = runtime.NumCPU()
+	config := ProcessorConfig{
+		OutputPath:   outputPath,
+		OutputFormat: OutputFormatCSV,
+		FileLimit:    fileLimit,
+		Workers:      workers,
+		DateFormat:   "2006-01-02", // Default: YYYY-MM-DD
+	}
+	return NewMarketDataProcessorWithConfig(config)
+}
+
+func NewMarketDataProcessorWithConfig(config ProcessorConfig) *MarketDataProcessor {
+	if config.Workers <= 0 {
+		config.Workers = runtime.NumCPU()
+	}
+
+	if config.DateFormat == "" {
+		config.DateFormat = "2006-01-02" // Default: YYYY-MM-DD
 	}
 
 	// Determine if outputPath is a file or directory
 	var outputDir, outputFile string
-	if outputPath != "" {
-		if strings.HasSuffix(outputPath, ".csv") {
-			outputFile = outputPath
-			outputDir = filepath.Dir(outputPath)
+	if config.OutputPath != "" {
+		ext := strings.ToLower(filepath.Ext(config.OutputPath))
+		if ext == ".csv" || ext == ".parquet" {
+			outputFile = config.OutputPath
+			outputDir = filepath.Dir(config.OutputPath)
 		} else {
-			outputDir = outputPath
+			outputDir = config.OutputPath
 		}
-		os.MkdirAll(outputDir, 0755)
+		if !strings.HasPrefix(config.OutputPath, "s3://") {
+			os.MkdirAll(outputDir, 0755)
+		}
 	} else {
 		outputDir = "processed_market_data"
 		os.MkdirAll(outputDir, 0755)
 	}
 
 	// Initialize S3 client
-	cfg, err := config.LoadDefaultConfig(context.Background())
+	awsCfg, err := awsconfig.LoadDefaultConfig(context.Background())
 	var s3Client *s3.Client
 	if err == nil {
-		s3Client = s3.NewFromConfig(cfg)
+		s3Client = s3.NewFromConfig(awsCfg)
 	} else {
 		log.Printf("Warning: failed to load AWS config: %v", err)
 	}
@@ -160,15 +195,74 @@ func NewMarketDataProcessor(outputPath string, fileLimit int, workers int) *Mark
 	greyhoundRegex := regexp.MustCompile(`^\d+\.\s*`)
 
 	return &MarketDataProcessor{
+		Config:         config,
 		OutputDir:      outputDir,
 		OutputFile:     outputFile,
-		FileLimit:      fileLimit,
-		Workers:        workers,
+		FileLimit:      config.FileLimit,
+		Workers:        config.Workers,
 		MarketStates:   make(map[string]*MarketState),
 		VenueRegex:     venueRegex,
 		GreyhoundRegex: greyhoundRegex,
 		S3Client:       s3Client,
 	}
+}
+
+// ExtractDateFromPath attempts to extract a date from an S3 or file path
+// Examples:
+//   - s3://bucket/PRO/2025/Sep/30/ -> 2025-09-30
+//   - s3://bucket/2025/09/30/ -> 2025-09-30
+//   - /path/2025/09/30 -> 2025-09-30
+func (p *MarketDataProcessor) ExtractDateFromPath(path string) (time.Time, error) {
+	// Remove s3:// prefix if present
+	path = strings.TrimPrefix(path, "s3://")
+
+	// Try to find YYYY/MMM/DD pattern (e.g., 2025/Sep/30)
+	monthNamePattern := regexp.MustCompile(`(\d{4})/(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)/(\d{1,2})`)
+	if matches := monthNamePattern.FindStringSubmatch(path); len(matches) == 4 {
+		dateStr := fmt.Sprintf("%s %s %s", matches[1], matches[2], matches[3])
+		t, err := time.Parse("2006 Jan 2", dateStr)
+		if err == nil {
+			return t, nil
+		}
+	}
+
+	// Try to find YYYY/MM/DD pattern (e.g., 2025/09/30)
+	numericPattern := regexp.MustCompile(`(\d{4})/(\d{1,2})/(\d{1,2})`)
+	if matches := numericPattern.FindStringSubmatch(path); len(matches) == 4 {
+		dateStr := fmt.Sprintf("%s-%s-%s", matches[1], matches[2], matches[3])
+		t, err := time.Parse("2006-1-2", dateStr)
+		if err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("could not extract date from path: %s", path)
+}
+
+// GenerateOutputPath creates the output file path with date-based naming
+// If outputPath contains {date}, it will be replaced with the formatted date
+// If outputPath is a directory, a file will be created with the date and format
+func (p *MarketDataProcessor) GenerateOutputPath(inputPath string) (string, error) {
+	date, err := p.ExtractDateFromPath(inputPath)
+	if err != nil {
+		return "", err
+	}
+
+	dateStr := date.Format(p.Config.DateFormat)
+	extension := string(p.Config.OutputFormat)
+
+	// If output path contains {date} placeholder, replace it
+	if strings.Contains(p.Config.OutputPath, "{date}") {
+		return strings.ReplaceAll(p.Config.OutputPath, "{date}", dateStr), nil
+	}
+
+	// If output path has an extension, use it as-is
+	if filepath.Ext(p.Config.OutputPath) != "" {
+		return p.Config.OutputPath, nil
+	}
+
+	// Otherwise, generate filename: path/summary-YYYY-MM-DD.csv
+	return filepath.Join(p.Config.OutputPath, fmt.Sprintf("summary-%s.%s", dateStr, extension)), nil
 }
 
 func (p *MarketDataProcessor) extractVenueFromEventName(eventName string) string {
@@ -993,6 +1087,9 @@ func (p *MarketDataProcessor) FinalizeProcessing() error {
 
 	// If single output file is specified, write all data to one file
 	if p.OutputFile != "" {
+		if p.Config.OutputFormat == OutputFormatParquet {
+			return p.saveSingleParquet(p.OutputFile, allData)
+		}
 		return p.saveSingleCSV(p.OutputFile, allData)
 	}
 
@@ -1021,6 +1118,11 @@ func (p *MarketDataProcessor) FinalizeProcessing() error {
 func (p *MarketDataProcessor) saveSingleCSV(outputPath string, data []SummaryRow) error {
 	if len(data) == 0 {
 		return nil
+	}
+
+	// Check if output is S3
+	if strings.HasPrefix(outputPath, "s3://") {
+		return p.writeCSVToS3(outputPath, data)
 	}
 
 	// Ensure directory exists
@@ -1076,6 +1178,160 @@ func (p *MarketDataProcessor) saveSingleCSV(outputPath string, data []SummaryRow
 	}
 
 	log.Printf("Created %s with %d records", outputPath, len(data))
+	return nil
+}
+
+func (p *MarketDataProcessor) writeCSVToS3(s3Path string, data []SummaryRow) error {
+	// Create a temporary file
+	tmpFile, err := os.CreateTemp("", "csv-*.csv")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Write CSV to temp file
+	writer := csv.NewWriter(tmpFile)
+
+	// Write header
+	header := []string{
+		"market_id", "selection_id", "event_id", "event_name", "venue", "greyhound_name", "market_time",
+		"bsp", "ltp", "price_30s_before_start", "total_traded_volume",
+		"max_traded_price", "min_traded_price", "year", "month", "day", "win",
+	}
+	if err := writer.Write(header); err != nil {
+		return err
+	}
+
+	// Write data
+	for _, row := range data {
+		record := []string{
+			row.MarketID,
+			strconv.FormatInt(row.SelectionID, 10),
+			row.EventID,
+			row.EventName,
+			row.Venue,
+			row.GreyhoundName,
+			row.MarketTime.Format(time.RFC3339),
+			formatFloat(row.BSP, row.HasBSP),
+			formatFloat(row.LTP, row.HasLTP),
+			formatFloat(row.Price30sBeforeStart, row.HasPrice30sBefore),
+			strconv.FormatFloat(row.TotalTradedVolume, 'f', -1, 64),
+			formatFloat(row.MaxTradedPrice, row.HasMaxTradedPrice),
+			formatFloat(row.MinTradedPrice, row.HasMinTradedPrice),
+			strconv.Itoa(row.Year),
+			strconv.Itoa(row.Month),
+			strconv.Itoa(row.Day),
+			strconv.FormatBool(row.Win),
+		}
+
+		if err := writer.Write(record); err != nil {
+			return err
+		}
+	}
+
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		return fmt.Errorf("failed to flush CSV writer: %w", err)
+	}
+
+	// Reopen file for reading
+	tmpFile.Seek(0, 0)
+
+	// Upload to S3
+	return p.uploadToS3(s3Path, tmpFile)
+}
+
+func (p *MarketDataProcessor) saveSingleParquet(outputPath string, data []SummaryRow) error {
+	if len(data) == 0 {
+		return nil
+	}
+
+	// Check if output is S3
+	if strings.HasPrefix(outputPath, "s3://") {
+		return p.writeParquetToS3(outputPath, data)
+	}
+
+	// Ensure directory exists
+	dir := filepath.Dir(outputPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+
+	// Create output file
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create parquet file: %w", err)
+	}
+	defer file.Close()
+
+	// Create parquet writer
+	writer := parquet.NewGenericWriter[SummaryRow](file)
+	defer writer.Close()
+
+	// Write all rows
+	if _, err := writer.Write(data); err != nil {
+		return fmt.Errorf("failed to write parquet data: %w", err)
+	}
+
+	log.Printf("Created %s with %d records", outputPath, len(data))
+	return nil
+}
+
+func (p *MarketDataProcessor) writeParquetToS3(s3Path string, data []SummaryRow) error {
+	// Create a temporary file
+	tmpFile, err := os.CreateTemp("", "parquet-*.parquet")
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	defer tmpFile.Close()
+
+	// Write parquet to temp file
+	writer := parquet.NewGenericWriter[SummaryRow](tmpFile)
+	if _, err := writer.Write(data); err != nil {
+		writer.Close()
+		return fmt.Errorf("failed to write parquet data: %w", err)
+	}
+	writer.Close()
+
+	// Reopen file for reading
+	tmpFile.Seek(0, 0)
+
+	// Upload to S3
+	return p.uploadToS3(s3Path, tmpFile)
+}
+
+func (p *MarketDataProcessor) uploadToS3(s3Path string, file io.Reader) error {
+	if p.S3Client == nil {
+		return fmt.Errorf("S3 client not initialized")
+	}
+
+	// Parse S3 path
+	bucket, key, err := parseS3Path(s3Path)
+	if err != nil {
+		return err
+	}
+
+	// Read file content
+	content, err := io.ReadAll(file)
+	if err != nil {
+		return fmt.Errorf("failed to read file: %w", err)
+	}
+
+	// Upload to S3
+	ctx := context.Background()
+	input := &s3.PutObjectInput{
+		Bucket: &bucket,
+		Key:    &key,
+		Body:   strings.NewReader(string(content)),
+	}
+
+	if _, err := p.S3Client.PutObject(ctx, input); err != nil {
+		return fmt.Errorf("failed to upload to S3: %w", err)
+	}
+
+	log.Printf("Uploaded %s to S3 with %d bytes", s3Path, len(content))
 	return nil
 }
 
