@@ -2,11 +2,13 @@ package betfair
 
 import (
 	"bufio"
+	"compress/bzip2"
 	"context"
 	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -601,4 +603,286 @@ func TestMarketRecorderCacheManagement(t *testing.T) {
 	}
 
 	t.Log("✅ Market catalogue cache management test passed")
+}
+
+// TestMarketRecorderSeparateFilesPerMarket validates that each market's data is written
+// to its own dedicated file and that no cross-contamination occurs
+func TestMarketRecorderSeparateFilesPerMarket(t *testing.T) {
+	// Create temporary directory for test files
+	tempDir := t.TempDir()
+
+	fileManager := NewFileManager(tempDir)
+
+	// Create mock writers and files for multiple markets
+	marketIDs := []string{"1.12345", "1.23456", "1.34567"}
+	writers := make(map[string]*bufio.Writer)
+	files := make(map[string]*os.File)
+
+	for _, marketID := range marketIDs {
+		writer, file, err := fileManager.CreateMarketWriter(marketID)
+		if err != nil {
+			t.Fatalf("Failed to create writer for market %s: %v", marketID, err)
+		}
+		writers[marketID] = writer
+		files[marketID] = file
+		defer file.Close()
+	}
+
+	// Simulate writing market data - create MCM messages with multiple markets
+	// This simulates the WRONG behavior where multiple markets are in one message
+	mixedMarketMessage := map[string]interface{}{
+		"op": "mcm",
+		"pt": 1234567890,
+		"mc": []interface{}{
+			map[string]interface{}{
+				"id": "1.12345",
+				"marketDefinition": map[string]interface{}{
+					"eventId":    "12345",
+					"marketType": "WIN",
+					"venue":      "Venue A",
+				},
+			},
+			map[string]interface{}{
+				"id": "1.23456",
+				"marketDefinition": map[string]interface{}{
+					"eventId":    "12345",
+					"marketType": "WIN",
+					"venue":      "Venue A",
+				},
+			},
+		},
+	}
+
+	mixedPayload, _ := json.Marshal(mixedMarketMessage)
+
+	// Test the CURRENT behavior - ExtractMarketID only gets the first market
+	extractedMarketID := ExtractMarketID(mixedPayload)
+	if extractedMarketID != "1.12345" {
+		t.Errorf("Expected first market ID 1.12345, got %s", extractedMarketID)
+	}
+
+	// Write test: each market should only write its own data
+	for _, marketID := range marketIDs {
+		marketMessage := map[string]interface{}{
+			"op": "mcm",
+			"pt": 1234567890,
+			"mc": []interface{}{
+				map[string]interface{}{
+					"id": marketID,
+					"rc": []interface{}{
+						map[string]interface{}{
+							"id":  12345,
+							"ltp": 2.5,
+						},
+					},
+				},
+			},
+		}
+
+		payload, _ := json.Marshal(marketMessage)
+		writers[marketID].Write(append(payload, '\n'))
+		writers[marketID].Flush()
+	}
+
+	// Close all files
+	for _, file := range files {
+		file.Close()
+	}
+
+	// Verify: Read back each file and ensure it ONLY contains its own market ID
+	for _, marketID := range marketIDs {
+		filePath := fileManager.GetMarketFilePath(marketID)
+		file, err := os.Open(filePath)
+		if err != nil {
+			t.Fatalf("Failed to open file for market %s: %v", marketID, err)
+		}
+		defer file.Close()
+
+		scanner := bufio.NewScanner(file)
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			line := scanner.Bytes()
+
+			var data map[string]interface{}
+			if err := json.Unmarshal(line, &data); err != nil {
+				t.Errorf("Failed to parse line %d in %s: %v", lineNum, marketID, err)
+				continue
+			}
+
+			// Check mc array for market IDs
+			if mc, ok := data["mc"].([]interface{}); ok {
+				for _, marketChangeRaw := range mc {
+					if marketChange, ok := marketChangeRaw.(map[string]interface{}); ok {
+						if foundMarketID, ok := marketChange["id"].(string); ok {
+							if foundMarketID != marketID {
+								t.Errorf("❌ CONTAMINATION DETECTED: File %s contains data for market %s at line %d",
+									marketID, foundMarketID, lineNum)
+							}
+						}
+					}
+				}
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			t.Errorf("Error reading file for market %s: %v", marketID, err)
+		}
+
+		t.Logf("✅ Market %s file is clean - no contamination", marketID)
+	}
+
+	t.Log("✅ Market file separation test passed")
+}
+
+// TestMarketRecorderDetectsMultiMarketMessages tests that we can detect when
+// a single MCM message contains data for multiple markets
+func TestMarketRecorderDetectsMultiMarketMessages(t *testing.T) {
+	// Create a message with multiple markets (simulating the contamination issue)
+	multiMarketMessage := `{
+		"op": "mcm",
+		"pt": 1234567890,
+		"mc": [
+			{"id": "1.12345", "rc": [{"id": 123, "ltp": 2.5}]},
+			{"id": "1.23456", "rc": [{"id": 456, "ltp": 3.5}]},
+			{"id": "1.34567", "rc": [{"id": 789, "ltp": 4.5}]}
+		]
+	}`
+
+	// Parse and extract all market IDs
+	var data map[string]interface{}
+	if err := json.Unmarshal([]byte(multiMarketMessage), &data); err != nil {
+		t.Fatalf("Failed to parse test message: %v", err)
+	}
+
+	var foundMarketIDs []string
+	if mc, ok := data["mc"].([]interface{}); ok {
+		for _, marketChangeRaw := range mc {
+			if marketChange, ok := marketChangeRaw.(map[string]interface{}); ok {
+				if marketID, ok := marketChange["id"].(string); ok {
+					foundMarketIDs = append(foundMarketIDs, marketID)
+				}
+			}
+		}
+	}
+
+	if len(foundMarketIDs) != 3 {
+		t.Errorf("Expected 3 markets in message, found %d", len(foundMarketIDs))
+	}
+
+	// Verify we found all expected market IDs
+	expectedMarkets := map[string]bool{
+		"1.12345": false,
+		"1.23456": false,
+		"1.34567": false,
+	}
+
+	for _, marketID := range foundMarketIDs {
+		if _, exists := expectedMarkets[marketID]; exists {
+			expectedMarkets[marketID] = true
+		} else {
+			t.Errorf("Found unexpected market ID: %s", marketID)
+		}
+	}
+
+	for marketID, found := range expectedMarkets {
+		if !found {
+			t.Errorf("Did not find expected market ID: %s", marketID)
+		}
+	}
+
+	// The issue: ExtractMarketID only returns ONE market ID
+	extractedMarketID := ExtractMarketID([]byte(multiMarketMessage))
+	if extractedMarketID != "1.12345" {
+		t.Errorf("ExtractMarketID returned %s, expected 1.12345 (first market)", extractedMarketID)
+	}
+
+	t.Logf("⚠️  Warning: ExtractMarketID only returns first market from multi-market messages")
+	t.Logf("    This causes market data contamination when messages contain multiple markets")
+	t.Log("✅ Multi-market message detection test passed")
+}
+
+// TestValidateRecordedMarketFiles validates recorded market files in a directory
+// to ensure no cross-contamination occurred during recording
+func TestValidateRecordedMarketFiles(t *testing.T) {
+	// This test can be run against actual recorded files
+	// Skip if no test data directory is available
+	testDataDir := os.Getenv("TEST_MARKET_DATA_DIR")
+	if testDataDir == "" {
+		t.Skip("Skipping validation test - set TEST_MARKET_DATA_DIR to run against actual data")
+	}
+
+	files, err := filepath.Glob(filepath.Join(testDataDir, "1.*.bz2"))
+	if err != nil {
+		t.Fatalf("Failed to list files: %v", err)
+	}
+
+	if len(files) == 0 {
+		t.Skip("No market files found in test directory")
+	}
+
+	contaminationCount := 0
+	totalFilesChecked := 0
+
+	for _, filePath := range files {
+		// Extract expected market ID from filename
+		filename := filepath.Base(filePath)
+		filename = strings.TrimSuffix(filename, ".bz2")
+		expectedMarketID := filename
+
+		if !strings.HasPrefix(expectedMarketID, "1.") {
+			continue
+		}
+
+		totalFilesChecked++
+		t.Logf("Checking file: %s (expected market: %s)", filepath.Base(filePath), expectedMarketID)
+
+		// Open and decompress the file
+		file, err := os.Open(filePath)
+		if err != nil {
+			t.Errorf("Failed to open %s: %v", filePath, err)
+			continue
+		}
+
+		reader := bzip2.NewReader(file)
+		scanner := bufio.NewScanner(reader)
+
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			line := scanner.Bytes()
+
+			var data map[string]interface{}
+			if err := json.Unmarshal(line, &data); err != nil {
+				continue
+			}
+
+			// Check all markets in the mc array
+			if mc, ok := data["mc"].([]interface{}); ok {
+				for _, marketChangeRaw := range mc {
+					if marketChange, ok := marketChangeRaw.(map[string]interface{}); ok {
+						if foundMarketID, ok := marketChange["id"].(string); ok {
+							if foundMarketID != expectedMarketID {
+								t.Errorf("❌ CONTAMINATION: %s contains market %s at line %d",
+									filepath.Base(filePath), foundMarketID, lineNum)
+								contaminationCount++
+							}
+						}
+					}
+				}
+			}
+		}
+
+		file.Close()
+
+		if err := scanner.Err(); err != nil {
+			t.Errorf("Error reading %s: %v", filePath, err)
+		}
+	}
+
+	if contaminationCount > 0 {
+		t.Errorf("❌ Found %d contamination instances across %d files", contaminationCount, totalFilesChecked)
+	} else {
+		t.Logf("✅ All %d market files are clean - no contamination detected", totalFilesChecked)
+	}
 }

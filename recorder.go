@@ -199,15 +199,43 @@ func (r *MarketRecorder) readMessage(ctx context.Context, stream *StreamConn, wr
 			return nil
 		}
 
-		marketID := ExtractMarketID(payload)
-		if marketID != "" {
+		// Parse the message to extract ALL market IDs
+		var data map[string]interface{}
+		if err := json.Unmarshal(payload, &data); err != nil {
+			return fmt.Errorf("failed to parse MCM message: %w", err)
+		}
+
+		mc, ok := data["mc"].([]interface{})
+		if !ok || len(mc) == 0 {
+			return nil
+		}
+
+		// Process each market separately
+		for _, marketChangeRaw := range mc {
+			marketChange, ok := marketChangeRaw.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			marketID, ok := marketChange["id"].(string)
+			if !ok || marketID == "" {
+				continue
+			}
+
 			// Fetch market catalogue if we don't have it yet
 			if err := r.fetchMarketCatalogue(ctx, marketID); err != nil {
 				r.logger.Error().Err(err).Str("market_id", marketID).Msg("failed to fetch market catalogue")
 				// Continue processing even if catalogue fetch fails
 			}
 
-			newStatus := ExtractMarketStatus(payload)
+			// Extract status for this specific market
+			newStatus := ""
+			if marketDef, ok := marketChange["marketDefinition"].(map[string]interface{}); ok {
+				if status, ok := marketDef["status"].(string); ok {
+					newStatus = status
+				}
+			}
+
 			var oldStatus string
 			marketJustSettled := false
 			if newStatus != "" {
@@ -225,13 +253,28 @@ func (r *MarketRecorder) readMessage(ctx context.Context, stream *StreamConn, wr
 			}
 
 			if writer, exists := writers[marketID]; exists {
-				// First remove the ID field
-				filteredPayload, err := RemoveIDField(payload)
-				if err != nil {
-					return fmt.Errorf("filter payload for market %s: %w", marketID, err)
+				// Create a single-market message for this market only
+				singleMarketData := map[string]interface{}{
+					"op":  data["op"],
+					"pt":  data["pt"],
+					"clk": data["clk"],
+					"mc":  []interface{}{marketChange},
 				}
 
-				// Then enrich with market catalogue data
+				singleMarketPayload, err := json.Marshal(singleMarketData)
+				if err != nil {
+					r.logger.Error().Err(err).Str("market_id", marketID).Msg("failed to marshal single market message")
+					continue
+				}
+
+				// Remove the ID field
+				filteredPayload, err := RemoveIDField(singleMarketPayload)
+				if err != nil {
+					r.logger.Error().Err(err).Str("market_id", marketID).Msg("failed to filter payload")
+					continue
+				}
+
+				// Enrich with market catalogue data
 				enrichedPayload, err := r.enrichMarketData(marketID, filteredPayload)
 				if err != nil {
 					r.logger.Error().Err(err).Str("market_id", marketID).Msg("failed to enrich market data")
@@ -240,17 +283,29 @@ func (r *MarketRecorder) readMessage(ctx context.Context, stream *StreamConn, wr
 				}
 
 				if _, err := writer.Write(append(enrichedPayload, '\n')); err != nil {
-					return fmt.Errorf("write output for market %s: %w", marketID, err)
+					r.logger.Error().Err(err).Str("market_id", marketID).Msg("failed to write to file")
+					continue
 				}
 
 				if err := writer.Flush(); err != nil {
-					return fmt.Errorf("flush output for market %s: %w", marketID, err)
+					r.logger.Error().Err(err).Str("market_id", marketID).Msg("failed to flush file")
+					continue
 				}
 			}
 
 			if marketJustSettled {
 				r.logger.Info().Str("market_id", marketID).Str("status", newStatus).Msg("market settled")
-				if err := r.handleMarketSettlement(ctx, marketID, payload, writers); err != nil {
+
+				// Create single-market payload for settlement
+				singleMarketData := map[string]interface{}{
+					"op":  data["op"],
+					"pt":  data["pt"],
+					"clk": data["clk"],
+					"mc":  []interface{}{marketChange},
+				}
+				singleMarketPayload, _ := json.Marshal(singleMarketData)
+
+				if err := r.handleMarketSettlement(ctx, marketID, singleMarketPayload, writers); err != nil {
 					r.logger.Error().Err(err).Str("market_id", marketID).Msg("failed to handle market settlement")
 				}
 
