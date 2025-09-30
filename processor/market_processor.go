@@ -660,6 +660,10 @@ func (p *MarketDataProcessor) processReader(reader io.Reader, sourceName string)
 	// Extract expected market ID from filename (if it follows the pattern)
 	expectedMarketID := p.extractMarketIDFromPath(sourceName)
 
+	// Track all unique market IDs found in this file
+	foundMarketIDs := make(map[string]bool)
+	mismatchCount := 0
+
 	scanner := bufio.NewScanner(reader)
 	lineCount := 0
 
@@ -679,9 +683,19 @@ func (p *MarketDataProcessor) processReader(reader io.Reader, sourceName string)
 					for _, marketChangeRaw := range mc {
 						if marketChange, ok := marketChangeRaw.(map[string]interface{}); ok {
 							if marketID, ok := marketChange["id"].(string); ok {
+								// Track this market ID
+								if !foundMarketIDs[marketID] {
+									foundMarketIDs[marketID] = true
+									// Log first occurrence of each unique market ID
+									if marketID != expectedMarketID {
+										log.Printf("⚠️  CONTAMINATION: File %s contains market %s (expected %s) at line %d",
+											filepath.Base(sourceName), marketID, expectedMarketID, lineCount)
+									}
+								}
+
+								// Count mismatches
 								if marketID != expectedMarketID {
-									log.Printf("WARNING: Market ID mismatch in %s: expected %s, found %s at line %d",
-										sourceName, expectedMarketID, marketID, lineCount)
+									mismatchCount++
 								}
 							}
 						}
@@ -713,6 +727,24 @@ func (p *MarketDataProcessor) processReader(reader io.Reader, sourceName string)
 
 	if err := scanner.Err(); err != nil {
 		log.Printf("Warning: error reading %s: %v", sourceName, err)
+	}
+
+	// Report contamination summary for this file
+	if expectedMarketID != "" && len(foundMarketIDs) > 0 {
+		if len(foundMarketIDs) == 1 && foundMarketIDs[expectedMarketID] {
+			// Clean file - only contains expected market
+			log.Printf("✅ File %s is clean (market %s only)", filepath.Base(sourceName), expectedMarketID)
+		} else {
+			// Contaminated file
+			var otherMarkets []string
+			for marketID := range foundMarketIDs {
+				if marketID != expectedMarketID {
+					otherMarkets = append(otherMarkets, marketID)
+				}
+			}
+			log.Printf("❌ File %s is CONTAMINATED: contains %d unique markets, %d mismatch instances. Other markets: %v",
+				filepath.Base(sourceName), len(foundMarketIDs), mismatchCount, otherMarkets)
+		}
 	}
 
 	log.Printf("Completed processing %d lines from %s", lineCount, sourceName)

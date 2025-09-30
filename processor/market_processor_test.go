@@ -554,3 +554,291 @@ func TestProcessBzipCompressedFile(t *testing.T) {
 		t.Error("Should not support .txt files")
 	}
 }
+
+// Integration test: Process clean single-market file
+func TestIntegrationCleanSingleMarketFile(t *testing.T) {
+	processor := NewMarketDataProcessor("", 0, 1)
+
+	// Process the clean test file
+	err := processor.ProcessFile("testdata/clean_single_market.json")
+	if err != nil {
+		t.Fatalf("Failed to process clean file: %v", err)
+	}
+
+	// Verify market was processed correctly
+	if len(processor.MarketStates) != 1 {
+		t.Errorf("Expected 1 market state, got %d", len(processor.MarketStates))
+	}
+
+	market, exists := processor.MarketStates["1.248394055"]
+	if !exists {
+		t.Fatal("Market 1.248394055 not found")
+	}
+
+	// Verify venue extraction
+	if market.Venue != "Warragul" {
+		t.Errorf("Expected venue 'Warragul', got '%s'", market.Venue)
+	}
+
+	// Verify 3 runners
+	if len(market.Runners) != 3 {
+		t.Errorf("Expected 3 runners, got %d", len(market.Runners))
+	}
+
+	// Verify winner status
+	winner, exists := market.Runners[47730803]
+	if !exists {
+		t.Fatal("Winner runner 47730803 not found")
+	}
+
+	if winner.Status != "WINNER" {
+		t.Errorf("Expected status 'WINNER', got '%s'", winner.Status)
+	}
+
+	if winner.Name != "Fast Runner" {
+		t.Errorf("Expected name 'Fast Runner', got '%s'", winner.Name)
+	}
+
+	if winner.BSP != 2.8 {
+		t.Errorf("Expected BSP 2.8, got %f", winner.BSP)
+	}
+
+	// Verify price updates
+	if winner.LatestLTP != 3.0 {
+		t.Errorf("Expected latest LTP 3.0, got %f", winner.LatestLTP)
+	}
+
+	if winner.MaxTV != 400.0 {
+		t.Errorf("Expected max TV 400.0, got %f", winner.MaxTV)
+	}
+}
+
+// Integration test: Detect contamination in multi-market file
+func TestIntegrationDetectContamination(t *testing.T) {
+	processor := NewMarketDataProcessor("", 0, 1)
+
+	// Process contaminated file (simulating file named after first market)
+	err := processor.ProcessFile("testdata/contaminated_multi_market.json")
+	if err != nil {
+		t.Fatalf("Failed to process contaminated file: %v", err)
+	}
+
+	// Should have detected 3 markets in the file
+	if len(processor.MarketStates) != 3 {
+		t.Errorf("Expected 3 market states, got %d", len(processor.MarketStates))
+	}
+
+	// Verify all three markets were processed
+	markets := []string{"1.248394055", "1.248394060", "1.248394065"}
+	for _, marketID := range markets {
+		if _, exists := processor.MarketStates[marketID]; !exists {
+			t.Errorf("Market %s not found in processor state", marketID)
+		}
+	}
+
+	// Verify individual market data
+	market1, _ := processor.MarketStates["1.248394055"]
+	if market1.Venue != "Warragul" {
+		t.Errorf("Market 1: Expected venue 'Warragul', got '%s'", market1.Venue)
+	}
+
+	market2, _ := processor.MarketStates["1.248394060"]
+	if market2.Venue != "Sandown Park" {
+		t.Errorf("Market 2: Expected venue 'Sandown Park', got '%s'", market2.Venue)
+	}
+
+	market3, _ := processor.MarketStates["1.248394065"]
+	if market3.Venue != "Angle Park" {
+		t.Errorf("Market 3: Expected venue 'Angle Park', got '%s'", market3.Venue)
+	}
+}
+
+// Integration test: Venue extraction when eventName is null
+func TestIntegrationVenueExtractionNoEventName(t *testing.T) {
+	processor := NewMarketDataProcessor("", 0, 1)
+
+	// Process file with null eventName but valid venue field
+	err := processor.ProcessFile("testdata/venue_only_no_eventname.json")
+	if err != nil {
+		t.Fatalf("Failed to process file: %v", err)
+	}
+
+	// Verify market was processed
+	if len(processor.MarketStates) != 1 {
+		t.Errorf("Expected 1 market state, got %d", len(processor.MarketStates))
+	}
+
+	market, exists := processor.MarketStates["1.248394060"]
+	if !exists {
+		t.Fatal("Market 1.248394060 not found")
+	}
+
+	// Critical test: Venue should be extracted from venue field, not eventName
+	if market.Venue != "Warragul" {
+		t.Errorf("Expected venue 'Warragul' (from venue field), got '%s'", market.Venue)
+	}
+
+	// EventName should be empty since it was null
+	if market.EventName != "" {
+		t.Errorf("Expected empty event name, got '%s'", market.EventName)
+	}
+
+	// Verify runner data
+	runner, exists := market.Runners[47730801]
+	if !exists {
+		t.Fatal("Runner 47730801 not found")
+	}
+
+	if runner.Status != "WINNER" {
+		t.Errorf("Expected status 'WINNER', got '%s'", runner.Status)
+	}
+}
+
+// Integration test: Contamination detection with filename validation
+func TestIntegrationContaminationDetectionWithFilename(t *testing.T) {
+	processor := NewMarketDataProcessor("", 0, 1)
+
+	// Create a temporary file with contaminated data but named after first market
+	tmpFile, err := os.CreateTemp("", "1.248394055*.json")
+	if err != nil {
+		t.Fatalf("Failed to create temp file: %v", err)
+	}
+	defer os.Remove(tmpFile.Name())
+
+	// Write contaminated data (contains markets 1.248394055, 1.248394060, 1.248394065)
+	contaminatedData := `{"op":"mcm","pt":1727606400000,"clk":"12345","mc":[{"id":"1.248394055","marketDefinition":{"eventTypeId":"4339","marketType":"WIN","bettingType":"ODDS","venue":"Warragul","marketTime":"2025-09-29T12:00:00.000Z","runners":[{"id":47730801,"name":"1. Dog A","bsp":3.5,"status":"ACTIVE"}]}},{"id":"1.248394060","marketDefinition":{"eventTypeId":"4339","marketType":"WIN","bettingType":"ODDS","venue":"Sandown","marketTime":"2025-09-29T12:15:00.000Z","runners":[{"id":47730901,"name":"1. Dog B","bsp":2.5,"status":"ACTIVE"}]}}]}
+{"op":"mcm","pt":1727606401000,"clk":"12346","mc":[{"id":"1.248394055","rc":[{"id":47730801,"ltp":3.4}]},{"id":"1.248394060","rc":[{"id":47730901,"ltp":2.6}]}]}
+`
+	if _, err := tmpFile.WriteString(contaminatedData); err != nil {
+		t.Fatalf("Failed to write test data: %v", err)
+	}
+	tmpFile.Close()
+
+	// Process the file - this should detect contamination
+	err = processor.ProcessFile(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("Failed to process file: %v", err)
+	}
+
+	// Should detect 2 markets
+	if len(processor.MarketStates) != 2 {
+		t.Errorf("Expected 2 markets, got %d", len(processor.MarketStates))
+	}
+
+	// Both markets should be present
+	if _, exists := processor.MarketStates["1.248394055"]; !exists {
+		t.Error("Market 1.248394055 not found")
+	}
+
+	if _, exists := processor.MarketStates["1.248394060"]; !exists {
+		t.Error("Market 1.248394060 not found (contamination)")
+	}
+}
+
+// Test venue extraction priority: venue field takes precedence over eventName
+func TestVenueExtractionPriority(t *testing.T) {
+	processor := NewMarketDataProcessor("", 0, 1)
+
+	tests := []struct {
+		name             string
+		venue            interface{} // can be string or nil
+		eventName        interface{} // can be string or nil
+		expectedVenue    string
+		expectedEventName string
+	}{
+		{
+			name:             "Both venue and eventName present",
+			venue:            "Warragul",
+			eventName:        "Sandown Park (VIC) R1",
+			expectedVenue:    "Warragul", // venue field takes priority
+			expectedEventName: "Sandown Park (VIC) R1",
+		},
+		{
+			name:             "Only venue field present",
+			venue:            "Warragul",
+			eventName:        nil,
+			expectedVenue:    "Warragul",
+			expectedEventName: "",
+		},
+		{
+			name:             "Only eventName present",
+			venue:            nil,
+			eventName:        "Sandown Park (VIC) R1",
+			expectedVenue:    "Sandown Park", // extracted from eventName
+			expectedEventName: "Sandown Park (VIC) R1",
+		},
+		{
+			name:             "Neither present",
+			venue:            nil,
+			eventName:        nil,
+			expectedVenue:    "",
+			expectedEventName: "",
+		},
+		{
+			name:             "Empty strings",
+			venue:            "",
+			eventName:        "",
+			expectedVenue:    "",
+			expectedEventName: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// Create test MCM message
+			marketDef := map[string]interface{}{
+				"eventTypeId": "4339",
+				"marketType":  "WIN",
+				"bettingType": "ODDS",
+				"marketTime":  "2025-09-29T12:00:00.000Z",
+				"runners": []interface{}{
+					map[string]interface{}{
+						"id":     float64(12345),
+						"name":   "1. Test Dog",
+						"bsp":    float64(2.5),
+						"status": "ACTIVE",
+					},
+				},
+			}
+
+			// Add venue and eventName based on test case
+			if tt.venue != nil {
+				marketDef["venue"] = tt.venue
+			}
+			if tt.eventName != nil {
+				marketDef["eventName"] = tt.eventName
+			}
+
+			mcmData := map[string]interface{}{
+				"op": "mcm",
+				"pt": float64(1633024800000),
+				"mc": []interface{}{
+					map[string]interface{}{
+						"id":               "1.test",
+						"marketDefinition": marketDef,
+					},
+				},
+			}
+
+			// Reset processor state
+			processor.MarketStates = make(map[string]*MarketState)
+
+			// Process the message
+			processor.processMCMMessage(mcmData)
+
+			// Verify venue extraction
+			market, exists := processor.MarketStates["1.test"]
+			if !exists {
+				t.Fatal("Market not created")
+			}
+
+			if market.Venue != tt.expectedVenue {
+				t.Errorf("Expected venue '%s', got '%s'", tt.expectedVenue, market.Venue)
+			}
+
+			if market.EventName != tt.expectedEventName {
+				t.Errorf("Expected eventName '%s', got '%s'", tt.expectedEventName, market.EventName)
+			}
+		})
+	}
+}
